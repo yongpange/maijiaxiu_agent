@@ -3,7 +3,7 @@
 功能：
   1. 用 qwen3.8-omni-flash 看平铺图，抽出衣服事实
   2. 用 qwen3.7-plus 按槽位写场景句
-  3. 用 doubao-seedream-4-5 逐张生图，硬伤最多重做一次
+  3. 用 doubao-seedream-4-5 逐张生图，视觉模型自由评审，不通过就在原提示词后追加约束再生成一次
   4. 将生成的图片上传到飞书，并写入多维表格
 """
 
@@ -23,22 +23,25 @@ from lark_cli import BASE_DIR, base_batch_create, base_upload_attachment, write_
 from qwen_client import dashscope_configured, qwen_chat
 from buyer_show_prompt import (
     GARMENT_SYSTEM,
-    JUDGE_SYSTEM,
-    ImageChecklist,
     SlotMemory,
     build_borrow_pose_prompt,
     build_product_only_prompt,
     build_reference_scene_prompt,
     build_scene_messages,
-    checklist_from_response,
     contains_banned_scene_word,
-    failure_hint,
     garment_from_title,
     normalize_garment,
     parse_json_object,
-    prefer_candidate,
     sample_slot,
     scene_sentence_from_response,
+)
+from buyer_show_review import (
+    ImageReview,
+    build_retry_prompt,
+    pick_attempt,
+    prompt_diff,
+    retry_constraints,
+    review_buyer_show,
 )
 
 logger = logging.getLogger("image-generator")
@@ -383,35 +386,114 @@ def _download_image(url: str) -> bytes | None:
         return None
 
 
-def judge_buyer_show(product_bytes: bytes, generated_url: str) -> ImageChecklist:
-    """对照平铺图检查成图。只认衣服错误和四项硬伤，其余放行。"""
-    if not dashscope_configured():
-        logger.warning("未配置 DASHSCOPE_API_KEY，跳过成图硬伤检查")
-        return ImageChecklist(skipped=True)
-    generated = _download_image(generated_url)
-    if not generated:
-        logger.warning("成图下载失败，跳过硬伤检查")
-        return ImageChecklist(skipped=True)
+def _save_attempt_bytes(content: bytes, round_no: int) -> str:
+    """每次尝试都落成本地文件，豆包链接过期后页面仍能对比。"""
+    from utils import save_phone_jpeg
+
+    generated_dir = settings.paths.generated_image_dir
+    os.makedirs(generated_dir, exist_ok=True)
+    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{time.time_ns()}"
+    path = os.path.join(generated_dir, f"ai_r{round_no}_{stamp}.jpg")
     try:
-        text = qwen_chat(
-            [
-                {"role": "system", "content": JUDGE_SYSTEM},
-                {
-                    "role": "user",
-                    "content": [
-                        _image_content(product_bytes),
-                        _image_content(generated),
-                        {"type": "text", "text": "图1是商品平铺图，图2是生成的买家秀。只输出 JSON。"},
-                    ],
-                },
-            ],
-            model=settings.llm.vision_model,
-            temperature=0.1,
-        )
-        return checklist_from_response(text)
+        return save_phone_jpeg(content, path)
     except Exception as exc:
-        logger.warning("成图硬伤检查失败，本张放行: %s", exc)
-        return ImageChecklist(skipped=True)
+        logger.info("尝试图重压失败，原样保存: %s", exc)
+        raw = os.path.join(generated_dir, f"ai_r{round_no}_{stamp}.bin")
+        with open(raw, "wb") as handle:
+            handle.write(content)
+        return raw
+
+
+def _run_attempt(
+    *,
+    round_no: int,
+    prompt: str,
+    previous_prompt: str,
+    added_constraints: list[str],
+    image_bytes: bytes,
+    mode: str,
+    product_image_base64: str,
+    outfit_bytes: bytes | None,
+) -> dict:
+    """生成一张、落到本地、交给视觉模型自由评审。"""
+    gen_url, reference_field = _generate_one(
+        mode=mode,
+        prompt=prompt,
+        product_image_base64=product_image_base64,
+        outfit_bytes=outfit_bytes,
+    )
+    attempt = {
+        "round": round_no,
+        "prompt": prompt,
+        "added_constraints": added_constraints,
+        "diff": prompt_diff(previous_prompt, prompt) if previous_prompt else [],
+        "image_url": gen_url or "",
+        "image_path": "",
+        "reference_field": reference_field,
+        "review": ImageReview(skipped=True, error="生图失败").to_dict(),
+    }
+    if not gen_url:
+        return attempt
+    content = _download_image(gen_url)
+    if content:
+        attempt["image_path"] = _save_attempt_bytes(content, round_no)
+    attempt["review"] = review_buyer_show(image_bytes, content).to_dict()
+    return attempt
+
+
+def _generate_with_review(
+    *,
+    index: int,
+    first_prompt: str,
+    image_bytes: bytes,
+    mode: str,
+    product_image_base64: str,
+    outfit_bytes: bytes | None,
+    prior_attempt: dict | None,
+    note: str,
+) -> dict:
+    """一张图最多新生成两次。第二次提示词是第一次原文加上评审约束。"""
+    attempts: list[dict] = []
+    previous_prompt = ""
+    added: list[str] = []
+    if prior_attempt and prior_attempt.get("prompt"):
+        prior = {**prior_attempt, "from_previous_round": True}
+        attempts.append(prior)
+        previous_prompt = str(prior.get("prompt") or "")
+        added = retry_constraints(ImageReview.from_dict(prior.get("review")), note)
+        first_prompt = build_retry_prompt(previous_prompt, added)
+
+    first = _run_attempt(
+        round_no=len(attempts) + 1,
+        prompt=first_prompt,
+        previous_prompt=previous_prompt,
+        added_constraints=added,
+        image_bytes=image_bytes,
+        mode=mode,
+        product_image_base64=product_image_base64,
+        outfit_bytes=outfit_bytes,
+    )
+    attempts.append(first)
+
+    first_review = ImageReview.from_dict(first.get("review"))
+    if first.get("image_url") and not first_review.passed and first_review.constraints and not first_review.skipped:
+        constraints = retry_constraints(first_review)
+        logger.info("第 %d 张评审未通过，追加 %d 条约束重做", index + 1, len(constraints))
+        attempts.append(_run_attempt(
+            round_no=len(attempts) + 1,
+            prompt=build_retry_prompt(first_prompt, constraints),
+            previous_prompt=first_prompt,
+            added_constraints=constraints,
+            image_bytes=image_bytes,
+            mode=mode,
+            product_image_base64=product_image_base64,
+            outfit_bytes=outfit_bytes,
+        ))
+
+    start = 1 if prior_attempt and prior_attempt.get("prompt") else 0
+    picked = pick_attempt(attempts[start:])
+    chosen = picked + start if picked >= 0 else -1
+    return {"index": index, "chosen": chosen, "attempts": attempts}
 
 
 def _render_prompt(
@@ -467,6 +549,7 @@ def run_image_generation(
     reject_note: str = "",
     only_indexes: list[int] | None = None,
     review_text: str = "",
+    prior_attempts: list[dict] | None = None,
 ) -> dict:
     """
     按晒图数量逐张生成。
@@ -474,19 +557,22 @@ def run_image_generation(
     有穿搭参考图且张数不超过参考图时，沿用参考图的场景，不另写场景句。
     张数更多时，多出来的只借姿势并新写场景。
     没有参考图时，每张单独抽槽位、单独写场景句。
-    衣服硬伤或四项画面硬伤才重做这一张，最多一次；新图没有更好就留旧图。
+    视觉模型自由指出问题。不通过时保留原提示词，只在末尾追加约束，再生成一次。
+    prior_attempts 按图片序号存放上一轮采用的尝试。人工重做时不重写场景。
     """
     outfit_image_bytes_list = outfit_image_bytes_list or []
+    prior_attempts = prior_attempts or []
     result = {
         "status": "error",
         "message": "",
         "prompts": [],
         "image_urls": [],
+        "local_image_paths": [],
+        "attempts": [],
         "reference_mode": "product_plus_outfit" if outfit_image_bytes_list else "product_only",
         "outfit_reference_count": len(outfit_image_bytes_list),
         "reference_fields": [],
         "committed_to_feishu": False,
-        "checks": [],
         "image_indexes": [],
     }
 
@@ -525,78 +611,43 @@ def run_image_generation(
             outfit_bytes = None
             slot = sample_slot(garment, memory, rng)
 
-        try:
-            prompt = _render_prompt(
-                mode=mode,
-                garment=garment,
-                slot=slot,
-                reject_note=reject_note,
-                failure_hint_text="",
-                rng=rng,
-            )
-        except Exception as exc:
-            logger.info("第 %d 张场景句失败: %s", index + 1, exc)
-            continue
-
-        logger.info("正在生成第 %d/%d 张，模式=%s", index + 1, scene_count, mode)
-        gen_url, reference_field = _generate_one(
-            mode=mode,
-            prompt=prompt,
-            product_image_base64=product_image_base64,
-            outfit_bytes=outfit_bytes,
-        )
-        if not gen_url:
-            logger.info("第 %d 张生成失败，跳过", index + 1)
-            continue
-
-        checklist = judge_buyer_show(image_bytes, gen_url)
-        chosen_url = gen_url
-        chosen_prompt = prompt
-        chosen_field = reference_field
-        if checklist.needs_retry:
-            hint = failure_hint(checklist)
-            logger.info("第 %d 张硬伤 %s，重做一次", index + 1, hint)
-            retry_slot = sample_slot(garment, memory, rng) if mode != "use_ref_scene" else None
+        prior = prior_attempts[index] if index < len(prior_attempts) else None
+        prompt = ""
+        if not (prior and prior.get("prompt")):
             try:
-                retry_prompt = _render_prompt(
+                prompt = _render_prompt(
                     mode=mode,
                     garment=garment,
-                    slot=retry_slot or slot,
+                    slot=slot,
                     reject_note=reject_note,
-                    failure_hint_text=hint,
+                    failure_hint_text="",
                     rng=rng,
                 )
             except Exception as exc:
-                logger.info("第 %d 张重做场景句失败，留原图: %s", index + 1, exc)
-                retry_prompt = ""
-            retry_url = None
-            retry_field = ""
-            if retry_prompt:
-                retry_url, retry_field = _generate_one(
-                    mode=mode,
-                    prompt=retry_prompt,
-                    product_image_base64=product_image_base64,
-                    outfit_bytes=outfit_bytes,
-                )
-            if retry_url:
-                retry_check = judge_buyer_show(image_bytes, retry_url)
-                if prefer_candidate(checklist, retry_check):
-                    chosen_url = retry_url
-                    chosen_prompt = retry_prompt
-                    chosen_field = retry_field
-                    checklist = retry_check
-                else:
-                    logger.info("第 %d 张重做没有更好，留原图", index + 1)
+                logger.info("第 %d 张场景句失败: %s", index + 1, exc)
+                continue
 
-        generated_urls.append(chosen_url)
-        result["prompts"].append(chosen_prompt)
-        if chosen_field:
-            result["reference_fields"].append(chosen_field)
-        result["checks"].append({
-            "garment_issues": checklist.garment_issues,
-            "hard_defects": checklist.hard_defects,
-            "skipped": checklist.skipped,
-        })
+        logger.info("正在生成第 %d/%d 张，模式=%s", index + 1, scene_count, mode)
+        group = _generate_with_review(
+            index=index,
+            first_prompt=prompt,
+            image_bytes=image_bytes,
+            mode=mode,
+            product_image_base64=product_image_base64,
+            outfit_bytes=outfit_bytes,
+            prior_attempt=prior if prior and prior.get("prompt") else None,
+            note=reject_note,
+        )
+        if group["chosen"] < 0:
+            logger.info("第 %d 张生成失败，跳过", index + 1)
+            continue
+        chosen = group["attempts"][group["chosen"]]
+        generated_urls.append(chosen["image_url"])
+        result["attempts"].append(group)
+        result["prompts"].append(chosen["prompt"])
+        result["local_image_paths"].append(chosen.get("image_path") or "")
+        if chosen.get("reference_field"):
+            result["reference_fields"].append(chosen["reference_field"])
 
     result["image_urls"] = generated_urls
     short = len(generated_urls) < len(indexes)

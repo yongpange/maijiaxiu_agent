@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
+from buyer_show_review import ImageReview
 from buyer_show_prompt import (
     SCENE_SYSTEM,
     ImageChecklist,
@@ -117,8 +118,11 @@ def test_outfit_refs_do_not_write_a_new_scene():
         "image_generator.generate_lifestyle_image_with_references",
         return_value=("https://example.com/a.jpg", "image"),
     ) as ref, patch(
-        "image_generator.judge_buyer_show",
-        return_value=ImageChecklist(),
+        "image_generator.review_buyer_show",
+        return_value=ImageReview(passed=True, score=8),
+    ), patch(
+        "image_generator._download_image",
+        return_value=b"outfit-jpeg",
     ):
         result = run_image_generation(
             image_bytes=b"product-image-bytes" * 20,
@@ -133,22 +137,26 @@ def test_outfit_refs_do_not_write_a_new_scene():
     assert "测试卫衣" in result["prompts"][0]
 
 
-def test_failed_image_retries_once_and_can_keep_the_original():
+def test_failed_image_retries_once_on_the_same_prompt():
+    from buyer_show_review import RETRY_HEADER
+
+    floor = ImageReview(passed=False, score=3, problems=["裙摆拖地"], constraints=["裙摆停在脚踝上方"])
+    still = ImageReview(passed=False, score=2, problems=["裙摆仍拖地"], constraints=["裙摆离开地面"])
     with patch(
         "image_generator.extract_garment_facts",
         return_value={"one_line": "深酒红丝绒连衣裙", "season": "冬", "occasion": "约会吃饭"},
     ), patch(
         "image_generator.write_scene_sentence",
-        side_effect=["第一句", "第二句"],
+        return_value="第一句",
     ) as writer, patch(
         "image_generator.generate_lifestyle_image",
         side_effect=["http://old", "http://new"],
     ), patch(
-        "image_generator.judge_buyer_show",
-        side_effect=[
-            ImageChecklist(garment_issues=["颜色"]),
-            ImageChecklist(garment_issues=["领口"]),
-        ],
+        "image_generator._download_image",
+        return_value=b"\xff\xd8jpeg",
+    ), patch(
+        "image_generator.review_buyer_show",
+        side_effect=[floor, still],
     ):
         result = run_image_generation(
             image_bytes=b"\xff\xd8jpeg",
@@ -156,9 +164,12 @@ def test_failed_image_retries_once_and_can_keep_the_original():
             scene_count=1,
             commit_to_feishu=False,
         )
+    first, second = result["attempts"][0]["attempts"]
     assert result["image_urls"] == ["http://old"]
-    assert writer.call_count == 2
-    assert writer.call_args_list[1].kwargs["failure_hint_text"] == "颜色"
+    assert writer.call_count == 1
+    assert second["prompt"].startswith(first["prompt"])
+    assert RETRY_HEADER in second["prompt"]
+    assert "裙摆停在脚踝上方" in second["prompt"]
 
 
 def test_only_selected_index_is_generated():
@@ -172,8 +183,11 @@ def test_only_selected_index_is_generated():
         "image_generator.generate_lifestyle_image",
         return_value="http://only",
     ) as gen, patch(
-        "image_generator.judge_buyer_show",
-        return_value=ImageChecklist(),
+        "image_generator.review_buyer_show",
+        return_value=ImageReview(passed=True, score=8),
+    ), patch(
+        "image_generator._download_image",
+        return_value=b"\xff\xd8jpeg",
     ):
         result = run_image_generation(
             image_bytes=b"\xff\xd8jpeg",

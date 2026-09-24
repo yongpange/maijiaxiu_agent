@@ -150,11 +150,26 @@ function updateTableWithResults(results) {
       const parts = [];
       if (r.approval_id) {
         parts.push(`待审核(${r.approval_id})`);
+      } else if (r.auto_accepted) {
+        parts.push('评审通过，已自动收下');
       } else if (r.status === 'success') {
         parts.push('已完成');
       }
       if (r.image_urls && r.image_urls.length) parts.push(`${r.image_urls.length}张晒图`);
-      noteCell.textContent = parts.join(', ') || '完成';
+      const groups = r.image_attempts || [];
+      noteCell.innerHTML = escapeHtml(parts.join(', ') || '完成')
+        + (groups.length
+          ? ` <button class="btn-link" onclick="toggleRowDetail('${r.record_id}')">${retrySummary(groups)}</button>`
+          : '');
+      const oldDetail = document.getElementById(`detail-${r.record_id}`);
+      if (oldDetail) oldDetail.remove();
+      if (groups.length) {
+        const detail = document.createElement('tr');
+        detail.id = `detail-${r.record_id}`;
+        detail.className = 'detail-row hidden';
+        detail.innerHTML = `<td colspan="8">${renderAttemptGroups(groups, `row-${r.record_id}`)}</td>`;
+        tr.after(detail);
+      }
     } else {
       statusCell.innerHTML = '<span class="row-status error">失败</span>';
       noteCell.innerHTML = `<span class="cell-error" title="${escapeHtml(r.error || '')}">${escapeHtml(r.error || '未知错误')}</span>`;
@@ -207,8 +222,11 @@ function renderApprovalArea(approvals) {
     const isImageReview = approvalType === 'image_review';
     const regenerateCount = (item.extra || {}).regenerate_count || 0;
 
+    const attemptGroups = (item.extra || {}).image_attempts || [];
     let imagesHtml = '';
-    if (imagePaths.length > 0) {
+    if (attemptGroups.length > 0) {
+      imagesHtml = renderAttemptGroups(attemptGroups, `approval-${item.approval_id}`, isImageReview);
+    } else if (imagePaths.length > 0) {
       imagesHtml = '<div class="approval-images">';
       imagePaths.forEach((p, index) => {
         const filename = p.replace(/\\/g, '/').split('/').pop();
@@ -304,6 +322,182 @@ async function approveAction(approvalId, action, note, imageIndexes) {
     alert(`操作失败: ${e.message}`);
     await loadPendingApprovals();
   }
+}
+
+const COLLAPSE_EQUAL_OVER = 80;
+const COLLAPSE_KEEP = 24;
+
+function imageSrcOf(attempt) {
+  const path = (attempt && attempt.image_path) || '';
+  if (path) {
+    const filename = path.replace(/\\/g, '/').split('/').pop();
+    return '/generated-images/' + encodeURIComponent(filename);
+  }
+  return (attempt && attempt.image_url) || '';
+}
+
+function reviewOf(attempt) {
+  return (attempt && attempt.review) || {};
+}
+
+function retrySummary(groups) {
+  const retried = groups.filter((g) => (g.attempts || []).filter((a) => !a.from_previous_round).length > 1).length;
+  return retried ? `查看生成过程（${retried} 张重做过）` : '查看生成过程';
+}
+
+function groupStatus(group) {
+  const attempts = group.attempts || [];
+  const chosen = attempts[group.chosen] || {};
+  const review = reviewOf(chosen);
+  const newRounds = attempts.filter((a) => !a.from_previous_round).length;
+  const redoText = newRounds > 1 ? `重做 ${newRounds - 1} 次` : '一次生成';
+  if (review.skipped) return { cls: 'warn', text: `${redoText} · 未完成评审` };
+  if (review.pass) return { cls: 'ok', text: `${redoText} · 已通过` };
+  return { cls: 'bad', text: `${redoText} · 仍需人工` };
+}
+
+function renderAttemptGroups(groups, scope, redo) {
+  let grid = '<div class="shot-grid">';
+  let panels = '';
+  groups.forEach((group, gi) => {
+    const attempts = group.attempts || [];
+    const chosen = attempts[group.chosen] || attempts[attempts.length - 1] || {};
+    const src = imageSrcOf(chosen);
+    const status = groupStatus(group);
+    const panelId = `cmp-${scope}-${gi}`;
+    const canCompare = attempts.length > 1;
+    const imageIndex = Number.isInteger(group.index) ? group.index : gi;
+    const redoHtml = redo
+      ? `<label class="redo-toggle"><input type="checkbox" class="redo-check" value="${imageIndex}">重做这张</label>`
+      : '';
+    grid += `<div class="shot-card">
+      ${redoHtml}
+      <a href="${escapeHtml(src)}" target="_blank" class="approval-img-link">
+        <img src="${escapeHtml(src)}" alt="第 ${gi + 1} 张" class="approval-img" loading="lazy">
+        <span class="shot-badge ${status.cls}">${escapeHtml(status.text)}</span>
+      </a>
+      <div class="shot-foot">
+        <span>第 ${gi + 1} 张 · ${reviewOf(chosen).score ?? 0} 分</span>
+        ${canCompare ? `<button class="btn-link" onclick="toggleCompare('${panelId}', this)">对比两次</button>` : ''}
+      </div>
+    </div>`;
+    if (canCompare) panels += renderComparePanel(attempts, panelId, gi);
+  });
+  grid += '</div>';
+  return grid + panels;
+}
+
+function renderComparePanel(attempts, panelId, gi) {
+  const lastPair = attempts.length - 1;
+  let tabs = '';
+  if (attempts.length > 2) {
+    tabs = '<div class="cmp-tabs">';
+    for (let i = 1; i < attempts.length; i += 1) {
+      tabs += `<button type="button" class="cmp-tab ${i === lastPair ? 'active' : ''}" onclick="switchPair('${panelId}', ${i}, this)">${attemptLabel(attempts[i - 1], i - 1)} → ${attemptLabel(attempts[i], i)}</button>`;
+    }
+    tabs += '</div>';
+  }
+  let pairs = '';
+  for (let i = 1; i < attempts.length; i += 1) {
+    pairs += `<div class="cmp-pair ${i === lastPair ? '' : 'hidden'}" data-pair="${i}">
+      ${renderPair(attempts[i - 1], attempts[i], i - 1, i)}
+    </div>`;
+  }
+  return `<div id="${panelId}" class="compare-panel hidden">
+    <div class="cmp-head">
+      <span class="cmp-title">第 ${gi + 1} 张的生成过程</span>
+      <label class="cmp-toggle"><input type="checkbox" onchange="toggleFullPrompt('${panelId}', this.checked)">看全文</label>
+    </div>
+    ${tabs}
+    ${pairs}
+  </div>`;
+}
+
+function attemptLabel(attempt, index) {
+  return attempt.from_previous_round ? '上一轮' : `第 ${index + 1} 次`;
+}
+
+function renderPair(before, after, bi, ai) {
+  const added = after.added_constraints || [];
+  const diff = (after.diff && after.diff.length)
+    ? after.diff
+    : [{ op: 'equal', text: before.prompt || '' }, { op: 'insert', text: (after.prompt || '').slice((before.prompt || '').length) }];
+  return `<div class="cmp-shots">
+      ${renderAttemptColumn(before, bi)}
+      <div class="cmp-arrow">→</div>
+      ${renderAttemptColumn(after, ai)}
+    </div>
+    <div class="cmp-rules">
+      <div class="cmp-section-title">${attemptLabel(after, ai)}新增的约束（${added.length} 条）</div>
+      ${added.length
+        ? `<ol>${added.map((c) => `<li>${escapeHtml(c)}</li>`).join('')}</ol>`
+        : '<div class="cmp-empty">没有追加约束</div>'}
+    </div>
+    <div class="cmp-section-title">提示词变化 <span class="cmp-legend"><ins>新增</ins><del>删除</del></span></div>
+    <div class="diff-view compact">${renderDiff(diff, true)}</div>
+    <div class="diff-view full">${renderDiff(diff, false)}</div>`;
+}
+
+function renderAttemptColumn(attempt, index) {
+  const review = reviewOf(attempt);
+  const src = imageSrcOf(attempt);
+  const problems = review.problems || [];
+  const verdict = review.skipped
+    ? `<span class="verdict warn">未评审</span>`
+    : (review.pass ? '<span class="verdict ok">通过</span>' : '<span class="verdict bad">未通过</span>');
+  return `<div class="cmp-col">
+    <div class="cmp-col-head">${escapeHtml(attemptLabel(attempt, index))} ${verdict} <span class="cmp-score">${review.score ?? 0} 分</span></div>
+    ${src
+      ? `<a href="${escapeHtml(src)}" target="_blank" class="cmp-img-link"><img src="${escapeHtml(src)}" alt="${escapeHtml(attemptLabel(attempt, index))}" loading="lazy"></a>`
+      : '<div class="cmp-img-missing">图片未生成</div>'}
+    ${problems.length
+      ? `<ul class="cmp-problems">${problems.map((p) => `<li>${escapeHtml(p)}</li>`).join('')}</ul>`
+      : `<div class="cmp-empty">${escapeHtml(review.error || '评审没有指出问题')}</div>`}
+  </div>`;
+}
+
+function renderDiff(segments, compact) {
+  return segments.map((seg) => {
+    const text = seg.text || '';
+    if (seg.op === 'insert') return `<ins>${escapeHtml(text)}</ins>`;
+    if (seg.op === 'delete') return `<del>${escapeHtml(text)}</del>`;
+    if (compact && text.length > COLLAPSE_EQUAL_OVER) {
+      const hidden = text.length - COLLAPSE_KEEP * 2;
+      return `<span>${escapeHtml(text.slice(0, COLLAPSE_KEEP))}</span>`
+        + `<span class="diff-fold">…未改动 ${hidden} 字…</span>`
+        + `<span>${escapeHtml(text.slice(-COLLAPSE_KEEP))}</span>`;
+    }
+    return `<span>${escapeHtml(text)}</span>`;
+  }).join('');
+}
+
+function toggleCompare(panelId, btn) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  const opening = panel.classList.contains('hidden');
+  panel.classList.toggle('hidden', !opening);
+  if (btn) btn.textContent = opening ? '收起对比' : '对比两次';
+  if (opening) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function toggleFullPrompt(panelId, full) {
+  document.querySelectorAll(`#${panelId} .diff-view`).forEach((el) => {
+    el.classList.toggle('show-full', full);
+  });
+}
+
+function switchPair(panelId, pairIndex, btn) {
+  const panel = document.getElementById(panelId);
+  if (!panel) return;
+  panel.querySelectorAll('.cmp-pair').forEach((el) => {
+    el.classList.toggle('hidden', Number(el.dataset.pair) !== pairIndex);
+  });
+  panel.querySelectorAll('.cmp-tab').forEach((el) => el.classList.toggle('active', el === btn));
+}
+
+function toggleRowDetail(recordId) {
+  const row = document.getElementById(`detail-${recordId}`);
+  if (row) row.classList.toggle('hidden');
 }
 
 function escapeHtml(str) {

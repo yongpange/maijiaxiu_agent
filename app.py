@@ -307,6 +307,18 @@ def _confirm_image_review_approval(existing, note: str):
     return updated, commit_result
 
 
+def _merge_attempt_groups(previous: list, updated: list) -> list:
+    """按图片序号合并尝试记录，没重做的张保留上一轮。"""
+    merged = {}
+    for group in previous or []:
+        if isinstance(group, dict) and isinstance(group.get("index"), int):
+            merged[group["index"]] = group
+    for group in updated or []:
+        if isinstance(group, dict) and isinstance(group.get("index"), int):
+            merged[group["index"]] = group
+    return [merged[index] for index in sorted(merged)]
+
+
 def _regenerate_image_review_approval(existing, note: str, image_indexes: List[int]):
     """图片审核驳回：只重做选中的那几张，其余原图保留。"""
     from image_generator import run_image_generation
@@ -333,6 +345,20 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
         if path and os.path.isfile(path)
     ]
 
+    priors = [None] * image_count
+    for group in extra.get("image_attempts") or []:
+        group_index = group.get("index")
+        attempts = group.get("attempts") or []
+        chosen = group.get("chosen")
+        if (
+            isinstance(group_index, int)
+            and 0 <= group_index < image_count
+            and isinstance(chosen, int)
+            and 0 <= chosen < len(attempts)
+            and attempts[chosen].get("prompt")
+        ):
+            priors[group_index] = attempts[chosen]
+
     image_result = run_image_generation(
         image_bytes=product_image_bytes,
         product_name=existing.product_title,
@@ -341,6 +367,7 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
         commit_to_feishu=False,
         reject_note=note or "",
         only_indexes=indexes,
+        prior_attempts=priors,
     )
     if image_result.get("status") != "success":
         raise RuntimeError(image_result.get("message") or "重新生成候选图片失败")
@@ -360,6 +387,7 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
         "image_reference_fields": image_result.get("reference_fields", []),
         "reject_note": note,
         "replaced_indexes": indexes,
+        "image_attempts": _merge_attempt_groups(extra.get("image_attempts") or [], image_result.get("attempts") or []),
     }
     new_approval = db_create_approval(
         OUTBOX_DB_PATH,

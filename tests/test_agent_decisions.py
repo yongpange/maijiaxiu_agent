@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from buyer_show_prompt import decide_delivery
+from buyer_show_review import ImageReview, decide_delivery
 from agent_nodes import (
     generate_reviews_node,
     parse_input_node,
@@ -13,13 +13,23 @@ from agent_graph_v2 import _build_workflow
 from image_generator import run_image_generation
 
 
+def _group(index: int, review: ImageReview) -> dict:
+    return {
+        "index": index,
+        "chosen": 0,
+        "attempts": [{
+            "image_url": f"http://img/{index}",
+            "image_path": f"img-{index}.jpg",
+            "review": review.to_dict(),
+        }],
+    }
+
+
 def _clean_result(count: int = 2) -> dict:
+    review = ImageReview(passed=True, score=8)
     return {
         "image_urls": [f"http://img/{i}" for i in range(count)],
-        "checks": [
-            {"garment_issues": [], "hard_defects": [], "skipped": False}
-            for _ in range(count)
-        ],
+        "attempts": [_group(i, review) for i in range(count)],
     }
 
 
@@ -59,12 +69,12 @@ def test_clean_images_are_auto_accepted_even_if_review_is_enabled():
 
 def test_uncertain_images_still_wait_for_a_person():
     result = _clean_result()
-    result["checks"][1] = {"garment_issues": ["颜色"], "hard_defects": [], "skipped": False}
+    result["attempts"][1] = _group(1, ImageReview(passed=False, score=3, problems=["裙摆拖地"], constraints=["裙摆不要拖地"]))
     assert decide_delivery(result, requested_count=2, require_confirmation=True) == "human_review"
     short = _clean_result(1)
     assert decide_delivery(short, requested_count=2, require_confirmation=True) == "human_review"
     skipped = _clean_result()
-    skipped["checks"][0]["skipped"] = True
+    skipped["attempts"][0] = _group(0, ImageReview(skipped=True, error="评审结果无法解析"))
     assert decide_delivery(skipped, requested_count=2, require_confirmation=True) == "human_review"
     assert decide_delivery(None, requested_count=2, require_confirmation=True) == "fail"
 
@@ -94,8 +104,11 @@ def test_missing_image_marks_partial_instead_of_full_success():
         "image_generator.generate_lifestyle_image",
         side_effect=["http://ok", None],
     ), patch(
-        "image_generator.judge_buyer_show",
-        return_value=__import__("buyer_show_prompt", fromlist=["ImageChecklist"]).ImageChecklist(),
+        "image_generator.review_buyer_show",
+        return_value=ImageReview(passed=True, score=8),
+    ), patch(
+        "image_generator._download_image",
+        return_value=b"\xff\xd8jpeg",
     ):
         result = run_image_generation(
             image_bytes=b"\xff\xd8jpeg",

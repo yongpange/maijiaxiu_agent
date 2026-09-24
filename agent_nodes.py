@@ -12,7 +12,7 @@ from langgraph.types import interrupt
 
 from agent_state import AgentState
 from agent_tools import generate_reviews
-from buyer_show_prompt import decide_delivery
+from buyer_show_review import decide_delivery
 from image_generator import extract_garment_facts, run_image_generation
 from utils import (
     format_review_text_for_delivery,
@@ -201,7 +201,7 @@ def route_after_generate_reviews(state: AgentState) -> str:
 
 
 def route_after_generate_images(state: AgentState) -> str:
-    """看图通过就自己收下。只有不完整、没看成或仍有硬伤时，才进人审。"""
+    """看图通过就自己收下。不完整、评审被跳过或仍未通过时，才进人审。"""
     if state.get("error_message"):
         return "handle_error"
     decision = state.get("delivery_decision") or decide_delivery(

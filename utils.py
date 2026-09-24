@@ -124,6 +124,9 @@ def materialize_generated_images(
     urls = image_result.get("image_urls") or []
     if not urls:
         return []
+    saved = [p for p in (image_result.get("local_image_paths") or []) if p and os.path.isfile(p)]
+    if len(saved) == len(urls):
+        return saved
 
     generated_dir = output_dir or settings.paths.generated_image_dir
     os.makedirs(generated_dir, exist_ok=True)
