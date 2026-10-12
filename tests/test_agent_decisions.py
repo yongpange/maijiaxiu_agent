@@ -114,6 +114,7 @@ def test_missing_image_marks_partial_instead_of_full_success():
             image_bytes=b"\xff\xd8jpeg",
             product_name="羽绒服",
             scene_count=2,
+            shots_per_scene=1,
             commit_to_feishu=False,
         )
     assert result["status"] == "partial"

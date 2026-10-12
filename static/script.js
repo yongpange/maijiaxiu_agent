@@ -7,12 +7,16 @@ const progressText = document.getElementById('progressText');
 const tableArea = document.getElementById('tableArea');
 const approvalArea = document.getElementById('approvalArea');
 
+const ACTIVE_BATCH_KEY = 'maijiaxiu_active_batch';
+
 let previewRows = [];
 let requireConfirmation = false;
+let trackingBatchId = '';
 
 previewBtn.addEventListener('click', loadPreview);
 generateBtn.addEventListener('click', startBatchGenerate);
 loadPendingApprovals();
+restoreActiveBatch();
 
 async function loadPreview() {
   previewBtn.disabled = true;
@@ -31,7 +35,7 @@ async function loadPreview() {
     renderPreviewTable(previewRows);
     await loadPendingApprovals();
 
-    if (previewRows.length > 0) {
+    if (!trackingBatchId && previewRows.length > 0) {
       generateBtn.disabled = false;
     }
   } catch (e) {
@@ -87,50 +91,119 @@ function renderPreviewTable(rows) {
   tableArea.innerHTML = html;
 }
 
+function rememberBatch(batchId) {
+  trackingBatchId = batchId || '';
+  if (batchId) localStorage.setItem(ACTIVE_BATCH_KEY, batchId);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function restoreActiveBatch() {
+  let batchId = localStorage.getItem(ACTIVE_BATCH_KEY) || '';
+  try {
+    const resp = await fetch('/batch-generate-v2/current');
+    if (resp.ok) {
+      const current = await resp.json();
+      if (current.batch_id && (current.status === 'running' || !batchId)) {
+        batchId = current.batch_id;
+      }
+    }
+  } catch (e) {
+    if (!batchId) return;
+  }
+  if (!batchId) return;
+  rememberBatch(batchId);
+  if (!previewRows.length) {
+    await loadPreview();
+  }
+  await followBatch(batchId);
+}
+
 async function startBatchGenerate() {
   previewBtn.disabled = true;
   generateBtn.disabled = true;
   progressArea.classList.remove('hidden');
-  progressBar.style.width = '0%';
-  progressText.textContent = '正在批量生成，请勿关闭页面...';
-
+  progressBar.style.width = '8%';
+  progressText.textContent = '正在开始批量生成...';
   setBadge('running', '生成中...');
 
   try {
     const resp = await fetch('/batch-generate-v2', { method: 'POST' });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const data = await resp.json();
-
-    if (data.error) throw new Error(data.error);
-
-    requireConfirmation = !!data.require_confirmation;
-    const results = data.results || [];
-    const total = data.total || 0;
-    const successCount = data.success_count || 0;
-
-    progressBar.style.width = '100%';
-    progressText.textContent = requireConfirmation
-      ? `完成: ${successCount}/${total} 已生成，等待人工审核`
-      : `完成: ${successCount}/${total} 成功`;
-
-    updateTableWithResults(results);
-    if (requireConfirmation) {
-      setBadge('completed', `${successCount}/${total} 已生成，待审核图片`);
-      await loadPendingApprovals();
-    } else {
-      setBadge('completed', `${successCount}/${total} 成功`);
-    }
-
-    // 显示 checkpoint 恢复提示
-    if (data.batch_id) {
-      progressText.textContent += ` (batch_id: ${data.batch_id}，支持中断恢复)`;
-    }
+    if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+    if (!data.batch_id) throw new Error('没有拿到批次号');
+    rememberBatch(data.batch_id);
+    await followBatch(data.batch_id);
   } catch (e) {
     progressText.textContent = `批量生成失败: ${e.message}`;
     setBadge('error', '失败');
-  } finally {
     previewBtn.disabled = false;
-    generateBtn.disabled = false;
+    generateBtn.disabled = previewRows.length === 0;
+  }
+}
+
+async function followBatch(batchId) {
+  rememberBatch(batchId);
+  previewBtn.disabled = true;
+  generateBtn.disabled = true;
+  progressArea.classList.remove('hidden');
+  setBadge('running', '生成中...');
+
+  while (trackingBatchId === batchId) {
+    let data;
+    try {
+      const resp = await fetch(`/batch-generate-v2/status?batch_id=${encodeURIComponent(batchId)}`);
+      data = await resp.json();
+      if (resp.status === 404) {
+        localStorage.removeItem(ACTIVE_BATCH_KEY);
+        trackingBatchId = '';
+        progressText.textContent = '这次生成的进度已经找不到了';
+        setBadge('error', '已中断');
+        previewBtn.disabled = false;
+        generateBtn.disabled = previewRows.length === 0;
+        return;
+      }
+      if (!resp.ok || data.error && data.status !== 'error') {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+    } catch (e) {
+      progressText.textContent = `正在重连生成进度: ${e.message}`;
+      await sleep(2000);
+      continue;
+    }
+
+    const total = data.total || previewRows.filter((row) => row.should_process).length || 0;
+    const finished = (data.results || []).length;
+    if (data.status === 'running') {
+      const percent = total ? Math.max(8, Math.round((finished / total) * 100)) : 12;
+      progressBar.style.width = `${Math.min(percent, 95)}%`;
+      progressText.textContent = total
+        ? `正在生成 ${finished}/${total}，刷新页面会保持这个进度`
+        : '正在生成，刷新页面会保持这个进度';
+      updateTableWithResults(data.results || []);
+      await sleep(2000);
+      continue;
+    }
+
+    requireConfirmation = !!data.require_confirmation;
+    progressBar.style.width = '100%';
+    if (data.status === 'error') {
+      progressText.textContent = data.error || data.message || '批量生成失败';
+      setBadge('error', '失败');
+    } else {
+      const successCount = data.success_count || 0;
+      progressText.textContent = requireConfirmation
+        ? `完成: ${successCount}/${total} 已生成，等待人工审核`
+        : `完成: ${successCount}/${total} 成功`;
+      setBadge('completed', requireConfirmation ? `${successCount}/${total} 已生成，待审核图片` : `${successCount}/${total} 成功`);
+    }
+    updateTableWithResults(data.results || []);
+    if (requireConfirmation) await loadPendingApprovals();
+    previewBtn.disabled = false;
+    generateBtn.disabled = previewRows.length === 0;
+    return;
   }
 }
 
@@ -225,7 +298,7 @@ function renderApprovalArea(approvals) {
     const attemptGroups = (item.extra || {}).image_attempts || [];
     let imagesHtml = '';
     if (attemptGroups.length > 0) {
-      imagesHtml = renderAttemptGroups(attemptGroups, `approval-${item.approval_id}`, isImageReview);
+      imagesHtml = renderAttemptGroups(attemptGroups, `approval-${item.approval_id}`, isImageReview, item.approval_id, (item.extra || {}).phase === 'await_anchor');
     } else if (imagePaths.length > 0) {
       imagesHtml = '<div class="approval-images">';
       imagePaths.forEach((p, index) => {
@@ -243,14 +316,14 @@ function renderApprovalArea(approvals) {
     const hasError = (item.extra || {}).image_generation_failed;
     const errorBadge = hasError ? '<span class="error-badge">生成失败</span>' : '';
 
-    html += `<div class="approval-card" id="approval-${item.approval_id}" data-image-review="${isImageReview ? '1' : '0'}">
+    html += `<div class="approval-card" id="approval-${item.approval_id}" data-image-review="${isImageReview ? '1' : '0'}" data-phase="${escapeHtml((item.extra || {}).phase || '')}">
       <div class="approval-card-header">
         <div>
           <div class="approval-title">${escapeHtml(item.product_title || '未命名商品')}${errorBadge}</div>
           <div class="approval-meta">联系人：${escapeHtml(contacts || '-')} ｜ 图片：${imagePaths.length} 张${regenerateCount ? ` ｜ 已重生成 ${regenerateCount} 次` : ''}</div>
         </div>
         <div class="approval-actions">
-          <button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>审核通过</button>
+          ${(item.extra || {}).phase === 'await_anchor' ? '' : `<button class="btn btn-primary btn-sm" onclick="confirmApproval('${item.approval_id}')" ${hasError ? 'disabled' : ''}>审核通过</button>`}
           <button class="btn btn-secondary btn-sm" onclick="rejectApproval('${item.approval_id}')">${isImageReview ? '重做选中' : '驳回'}</button>
         </div>
       </div>
@@ -282,8 +355,17 @@ function formatReviewText(text) {
 }
 
 async function confirmApproval(approvalId) {
-  const note = window.prompt('审核通过备注（可选）', '') || '';
+  const note = window.prompt('审核通过备注（可选）', '');
+  if (note === null) return;
+  setCardBusy(approvalId, '正在提交审核并写回飞书，请稍等');
   await approveAction(approvalId, 'confirm', note);
+}
+
+async function confirmScene(approvalId, sceneIndex) {
+  const note = window.prompt('备注（可选，取消则不生成）', '');
+  if (note === null) return;
+  setCardBusy(approvalId, `正在生成场景 ${sceneIndex + 1} 的另外两张，其他场景不动`);
+  await approveAction(approvalId, 'confirm', note, [], sceneIndex);
 }
 
 function selectedImageIndexes(approvalId) {
@@ -300,26 +382,67 @@ async function rejectApproval(approvalId) {
     alert('请先勾选要重做的图片。没勾选的会保留。');
     return;
   }
-  const note = window.prompt(isImageReview ? '重做备注（可选）' : '驳回原因（可选）', '') || '';
+  const note = window.prompt(isImageReview ? '重做备注（可选，取消则不重做）' : '驳回原因（可选）', '');
+  if (note === null) return;
+  const labels = imageIndexes.map((index) => `第 ${index + 1} 张`).join('、');
+  setCardBusy(
+    approvalId,
+    isImageReview ? `正在重做${labels}，生成和评审需要一两分钟，页面会停在这里` : '正在驳回，请稍等',
+    imageIndexes,
+  );
   await approveAction(approvalId, 'reject', note, imageIndexes);
 }
 
-async function approveAction(approvalId, action, note, imageIndexes) {
+function setCardBusy(approvalId, message, imageIndexes) {
+  const card = document.getElementById(`approval-${approvalId}`);
+  if (!card) return;
+  card.classList.add('is-busy');
+  let bar = card.querySelector('.card-busy');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.className = 'card-busy';
+    const header = card.querySelector('.approval-card-header');
+    header.insertAdjacentElement('afterend', bar);
+  }
+  bar.textContent = message;
+  card.querySelectorAll('button, input').forEach((el) => { el.disabled = true; });
+  const redoBtn = card.querySelector('.approval-actions .btn-secondary');
+  if (redoBtn && (imageIndexes || []).length) redoBtn.textContent = '正在重做...';
+  (imageIndexes || []).forEach((index) => {
+    const box = card.querySelector(`.redo-check[value="${index}"]`);
+    const shot = box && box.closest('.shot-card, .approval-shot');
+    if (shot) shot.classList.add('is-redoing');
+  });
+  progressArea.classList.remove('hidden');
+  progressBar.style.width = '45%';
+  progressText.textContent = message;
+  setBadge('running', '处理中...');
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function approveAction(approvalId, action, note, imageIndexes, sceneIndex) {
   try {
-    const btnSelector = `#approval-${approvalId} .approval-actions button`;
-    document.querySelectorAll(btnSelector).forEach((b) => { b.disabled = true; });
+    const body = { note, image_indexes: imageIndexes || [] };
+    if (Number.isInteger(sceneIndex)) body.scene_index = sceneIndex;
     const resp = await fetch(`/delivery-approvals/${approvalId}/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ note, image_indexes: imageIndexes || [] }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json();
     if (!resp.ok || data.error) {
       throw new Error(data.error || `HTTP ${resp.status}`);
     }
+    progressBar.style.width = '100%';
+    progressText.textContent = Number.isInteger(sceneIndex)
+      ? `场景 ${sceneIndex + 1} 已补上，其他场景没有改`
+      : (action === 'reject' ? '重做完成，请再看新图' : '审核已提交');
+    setBadge('completed', Number.isInteger(sceneIndex) ? '已补这一组' : (action === 'reject' ? '重做完成' : '已提交'));
     await loadPendingApprovals();
   } catch (e) {
     alert(`操作失败: ${e.message}`);
+    progressText.textContent = `操作失败: ${e.message}`;
+    setBadge('error', '失败');
     await loadPendingApprovals();
   }
 }
@@ -356,7 +479,29 @@ function groupStatus(group) {
   return { cls: 'bad', text: `${redoText} · 仍需人工` };
 }
 
-function renderAttemptGroups(groups, scope, redo) {
+function renderAttemptGroups(groups, scope, redo, approvalId, allowFill) {
+  const hasScene = groups.some((group) => Number.isInteger(group.scene_index));
+  if (!hasScene) return renderShotGrid(groups, scope, redo);
+  const blocks = [];
+  groups.forEach((group) => {
+    let block = blocks.find((item) => item.scene === group.scene_index);
+    if (!block) {
+      block = { scene: group.scene_index, groups: [] };
+      blocks.push(block);
+    }
+    block.groups.push(group);
+  });
+  return blocks.map((block) => {
+    const onlyAnchor = allowFill && block.groups.length === 1 && block.groups[0].shot_index === 0;
+    const hint = onlyAnchor
+      ? `<div class="scene-hint">只根据场景 ${block.scene + 1} 的这张图，生成同组另外两张。其他场景不会动。</div>
+         <button type="button" class="btn btn-primary btn-sm scene-fill" onclick="confirmScene('${approvalId}', ${block.scene})">生成场景 ${block.scene + 1} 的另外两张</button>`
+      : '';
+    return `<div class="scene-block"><div class="scene-title">场景 ${block.scene + 1}</div>${hint}${renderShotGrid(block.groups, `${scope}-s${block.scene}`, redo)}</div>`;
+  }).join('');
+}
+
+function renderShotGrid(groups, scope, redo) {
   let grid = '<div class="shot-grid">';
   let panels = '';
   groups.forEach((group, gi) => {

@@ -349,6 +349,17 @@ def build_product_only_prompt(scene_sentence: str, one_line: str) -> str:
     return f"{scene_sentence}{garment_lock_tail(one_line)}{phone_camera_tail()}"
 
 
+def build_same_scene_prompt(scene_sentence: str, one_line: str, variation: str) -> str:
+    """后几张锁住第 1 张的人和地点，只换机位。图1 是平铺图，图2 是已通过的第 1 张。"""
+    return (
+        "图2是已经拍好的第一张买家秀。人物、脸、发型、体型、地点和光线都保持图2，"
+        "不要换成另一个人，不要换到另一个地方。"
+        f"{variation}。"
+        f"地点仍是：{scene_sentence}"
+        f"{garment_lock_tail(one_line)}{phone_camera_tail()}"
+    )
+
+
 def build_reference_scene_prompt(one_line: str, reject_note: str = "") -> str:
     text = (
         f"把图2里人物身上的衣服换成图1这件{one_line}。"

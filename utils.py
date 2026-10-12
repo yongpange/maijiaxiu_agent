@@ -83,6 +83,12 @@ def format_review_text_for_delivery(raw_text: Optional[str]) -> str:
     return sep.join(blocks) + "\n—————————————"
 
 
+def split_review_blocks(text: Optional[str]) -> List[str]:
+    """把已经格式化的评价拆回一条一条。"""
+    parts = [part.strip() for part in (text or "").split("—————————————")]
+    return [part for part in parts if part]
+
+
 # ============================================================
 # 图片下载和格式识别
 # ============================================================

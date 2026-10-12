@@ -342,6 +342,45 @@ body {
   padding: 1rem 1.2rem;
 }
 
+.approval-card.is-busy {
+  border-color: var(--accent);
+}
+
+.card-busy {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  margin-top: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  color: var(--text-primary);
+  font-size: 0.86rem;
+  line-height: 1.45;
+}
+
+.card-busy::before {
+  content: '';
+  width: 0.85rem;
+  height: 0.85rem;
+  flex: 0 0 auto;
+  border: 2px solid rgba(255, 255, 255, 0.28);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: card-spin 0.8s linear infinite;
+}
+
+@keyframes card-spin {
+  to { transform: rotate(360deg); }
+}
+
+.shot-card.is-redoing,
+.approval-shot.is-redoing {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 10px;
+}
+
 .approval-card-header {
   display: flex;
   align-items: flex-start;
@@ -683,3 +722,7 @@ body {
   .cmp-shots { grid-template-columns: 1fr; }
   .cmp-arrow { transform: rotate(90deg); justify-self: center; }
 }
+
+.scene-title { font-weight: 600; margin: 0.8rem 0 0.3rem; }
+.scene-hint { font-size: 0.8rem; color: var(--text-secondary); margin-bottom: 0.35rem; }
+.scene-fill { margin: 0.2rem 0 0.6rem; }

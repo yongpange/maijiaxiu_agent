@@ -162,6 +162,7 @@ def test_failed_image_retries_once_on_the_same_prompt():
             image_bytes=b"\xff\xd8jpeg",
             product_name="连衣裙",
             scene_count=1,
+            shots_per_scene=1,
             commit_to_feishu=False,
         )
     first, second = result["attempts"][0]["attempts"]
@@ -193,6 +194,7 @@ def test_only_selected_index_is_generated():
             image_bytes=b"\xff\xd8jpeg",
             product_name="连衣裙",
             scene_count=4,
+            shots_per_scene=1,
             only_indexes=[2],
             commit_to_feishu=False,
         )
@@ -201,6 +203,24 @@ def test_only_selected_index_is_generated():
     assert result["image_urls"] == ["http://only"]
     assert writer.call_count == 1
     assert gen.call_count == 1
+
+
+def test_scene_rows_keep_three_images_each():
+    from image_generator import group_images_by_scene
+    from utils import split_review_blocks
+
+    attempts = []
+    for scene, shots in ((0, ["a1", "a2", "a3"]), (1, ["b1", "b2", "b3"])):
+        for shot, path in enumerate(shots):
+            attempts.append({
+                "scene_index": scene,
+                "shot_index": shot,
+                "chosen": 0,
+                "attempts": [{"image_path": path}],
+            })
+    groups = group_images_by_scene(["a1", "a2", "a3", "b1", "b2", "b3"], attempts, 3)
+    assert groups == [["a1", "a2", "a3"], ["b1", "b2", "b3"]]
+    assert split_review_blocks("第一句\n—————————————\n第二句\n—————————————") == ["第一句", "第二句"]
 
 
 def test_merge_replaced_images_keeps_the_rest():

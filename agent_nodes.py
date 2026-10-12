@@ -114,7 +114,7 @@ def generate_images_node(state: AgentState) -> Dict[str, Any]:
             "local_image_paths": local_paths,
             "delivery_decision": decide_delivery(
                 result,
-                requested_count=image_count,
+                requested_count=int((result or {}).get("expected_count") or image_count),
                 require_confirmation=bool(state.get("require_confirmation")),
             ),
         }

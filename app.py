@@ -10,8 +10,10 @@ from __future__ import annotations
 import sys
 import io
 import os
+import json
 import asyncio
 import logging
+import threading
 
 if sys.stdout and hasattr(sys.stdout, "buffer"):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -103,6 +105,7 @@ def _get_batch_graph():
 class DeliveryApprovalActionRequest(BaseModel):
     note: str = Field(default="", description="确认/驳回备注")
     image_indexes: List[int] = Field(default_factory=list, description="要重做的图片下标，从 0 开始")
+    scene_index: Optional[int] = Field(default=None, description="只补这一个场景的同组图片")
 
 
 # ===== 根路径：返回聊天页面 =====
@@ -268,8 +271,126 @@ def _read_local_file_bytes(path: str) -> bytes:
         return f.read()
 
 
-def _confirm_image_review_approval(existing, note: str):
-    """图片审核通过：写飞书结果表，并更新源需求状态。"""
+def _chosen_of(group: dict) -> dict:
+    attempts = group.get("attempts") or []
+    chosen = group.get("chosen")
+    if isinstance(chosen, int) and 0 <= chosen < len(attempts):
+        return attempts[chosen]
+    return {}
+
+
+def _review_passed(group: dict) -> bool:
+    review = _chosen_of(group).get("review") or {}
+    return bool(review.get("pass") or review.get("passed")) and not review.get("skipped")
+
+
+def _scene_index_of(group: dict, shots: int) -> int:
+    if isinstance(group.get("scene_index"), int):
+        return group["scene_index"]
+    if isinstance(group.get("index"), int) and shots > 0:
+        return int(group["index"]) // shots
+    return 0
+
+
+def _shot_index_of(group: dict, shots: int) -> int:
+    if isinstance(group.get("shot_index"), int):
+        return group["shot_index"]
+    if isinstance(group.get("index"), int) and shots > 0:
+        return int(group["index"]) % shots
+    return 0
+
+
+def _confirm_anchor_and_fill(existing, note: str, scene_index: int):
+    """只补被点到的那一个场景。其他场景的图保持不动。"""
+    from image_generator import run_image_generation
+
+    extra = existing.extra or {}
+    shots = int(extra.get("shots_per_scene") or 1)
+    scene_count = int(extra.get("scene_count") or len(existing.image_paths) or 1)
+    if scene_index < 0 or scene_index >= scene_count:
+        raise RuntimeError(f"场景序号超出范围: {scene_index}")
+    product_image_bytes = _read_local_file_bytes(extra.get("product_image_path"))
+    priors = [None] * (scene_count * shots)
+    for group in extra.get("image_attempts") or []:
+        scene_i = _scene_index_of(group, shots)
+        if scene_i != scene_index or _shot_index_of(group, shots) != 0:
+            continue
+        chosen = dict(_chosen_of(group))
+        if not chosen.get("image_path"):
+            continue
+        chosen["scene_sentence"] = group.get("scene_sentence") or ""
+        priors[scene_i * shots] = chosen
+    if not priors[scene_index * shots]:
+        raise RuntimeError(f"场景 {scene_index + 1} 没有可参考的第 1 张")
+    follow_indexes = [scene_index * shots + shot for shot in range(1, shots)]
+    image_result = run_image_generation(
+        image_bytes=product_image_bytes,
+        product_name=existing.product_title,
+        scene_count=scene_count,
+        shots_per_scene=shots,
+        commit_to_feishu=False,
+        only_indexes=follow_indexes,
+        prior_attempts=priors,
+        reject_note=note or "",
+    )
+    if image_result.get("status") not in {"success", "partial"} or not image_result.get("image_urls"):
+        raise RuntimeError(image_result.get("message") or "同组图片生成失败")
+    groups = _merge_attempt_groups(extra.get("image_attempts") or [], image_result.get("attempts") or [])
+    paths = []
+    for group in sorted(groups, key=lambda item: (_scene_index_of(item, shots), _shot_index_of(item, shots))):
+        path = _chosen_of(group).get("image_path") or ""
+        if path:
+            paths.append(path)
+    filled = {
+        scene_i
+        for scene_i in range(scene_count)
+        if sum(1 for group in groups if _scene_index_of(group, shots) == scene_i) >= shots
+    }
+    still_waiting = len(filled) < scene_count
+    this_follows = [
+        group for group in groups
+        if _scene_index_of(group, shots) == scene_index and _shot_index_of(group, shots) > 0
+    ]
+    complete = (not still_waiting) and all(_review_passed(group) for group in this_follows) and len(paths) >= scene_count * shots
+    if not complete:
+        db_reject_approval(OUTBOX_DB_PATH, existing.approval_id, note=note or "第1张已通过，等待同组其余图片")
+        new_approval = db_create_approval(
+            OUTBOX_DB_PATH,
+            source=existing.source,
+            product_title=existing.product_title,
+            target_contacts=existing.target_contacts,
+            review_text=existing.review_text,
+            image_paths=paths,
+            file_paths=existing.file_paths,
+            max_retry=existing.max_retry,
+            extra={
+                **extra,
+                "phase": "await_anchor" if still_waiting else "review_set",
+                "image_count": scene_count * shots,
+                "image_attempts": groups,
+                "previous_approval_id": existing.approval_id,
+            },
+        )
+        return new_approval, {"status": "expanded", "message": "已补上同组图片，请再看一遍"}
+
+    existing.image_paths = paths
+    extra = {**extra, "phase": "review_set", "image_attempts": groups}
+    existing.extra = extra
+    return _commit_confirmed_images(existing, note)
+
+
+def _confirm_image_review_approval(existing, note: str, scene_index: Optional[int] = None):
+    """整组都在才写飞书。补图必须带场景序号，只生成那一组。"""
+    extra = existing.extra or {}
+    if extra.get("phase") == "await_anchor" and int(extra.get("shots_per_scene") or 1) > 1:
+        if scene_index is None:
+            raise RuntimeError("请选择要补图的场景")
+        return _confirm_anchor_and_fill(existing, note, scene_index)
+    return _commit_confirmed_images(existing, note)
+
+
+def _commit_confirmed_images(existing, note: str):
+    """把已经看过的整组图片写入飞书结果表。"""
     from image_generator import commit_images_to_feishu
     from feishu_reader import get_tenant_access_token, update_source_row_status
 
@@ -284,6 +405,9 @@ def _confirm_image_review_approval(existing, note: str):
         existing.product_title,
         product_image_path,
         existing.image_paths,
+        review_text=existing.review_text or "",
+        attempts=extra.get("image_attempts") or [],
+        shots_per_scene=int(extra.get("shots_per_scene") or 3),
     )
     if commit_result.get("status") != "success":
         raise RuntimeError(commit_result.get("message") or "写入飞书失败")
@@ -326,15 +450,25 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
     extra = existing.extra or {}
     product_image_path = extra.get("product_image_path")
     outfit_image_paths = extra.get("outfit_image_paths") or []
+    shots = int(extra.get("shots_per_scene") or 1)
+    scene_count = int(extra.get("scene_count") or extra.get("image_count") or len(existing.image_paths) or 1)
     image_count = int(extra.get("image_count") or len(existing.image_paths) or 1)
+    bound = len(existing.image_paths) if extra.get("phase") == "await_anchor" else image_count
 
     indexes: List[int] = []
     for raw in image_indexes:
         idx = int(raw)
-        if idx < 0 or idx >= image_count or idx >= len(existing.image_paths):
+        if idx < 0 or idx >= bound:
             raise RuntimeError(f"图片序号超出范围: {idx}")
         if idx not in indexes:
             indexes.append(idx)
+    if extra.get("phase") != "await_anchor" and shots > 1 and not outfit_image_paths:
+        expanded = set(indexes)
+        for idx in list(indexes):
+            if idx % shots == 0:
+                scene_i = idx // shots
+                expanded.update(range(scene_i * shots, (scene_i + 1) * shots))
+        indexes = sorted(expanded)
     if not indexes:
         raise RuntimeError("请选择要重做的图片")
 
@@ -357,25 +491,44 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
             and 0 <= chosen < len(attempts)
             and attempts[chosen].get("prompt")
         ):
-            priors[group_index] = attempts[chosen]
+            prior = dict(attempts[chosen])
+            prior["scene_sentence"] = group.get("scene_sentence") or prior.get("scene_sentence") or ""
+            priors[group_index] = prior
 
     image_result = run_image_generation(
         image_bytes=product_image_bytes,
         product_name=existing.product_title,
-        scene_count=image_count,
+        scene_count=scene_count if shots > 1 and not outfit_image_bytes_list else image_count,
+        shots_per_scene=1 if outfit_image_bytes_list else shots,
         outfit_image_bytes_list=outfit_image_bytes_list or None,
         commit_to_feishu=False,
         reject_note=note or "",
         only_indexes=indexes,
         prior_attempts=priors,
     )
-    if image_result.get("status") != "success":
+    if image_result.get("status") not in {"success", "partial"} or not image_result.get("image_urls"):
         raise RuntimeError(image_result.get("message") or "重新生成候选图片失败")
 
     replaced_paths = materialize_generated_images(image_result)
-    if len(replaced_paths) != len(indexes):
+    produced = [int(idx) for idx in (image_result.get("image_indexes") or indexes)]
+    if len(replaced_paths) != len(produced):
         raise RuntimeError("重新生成的候选图片数量和选中数量不一致")
-    local_image_paths = merge_replaced_images(existing.image_paths, indexes, replaced_paths)
+    if produced == indexes:
+        local_image_paths = merge_replaced_images(existing.image_paths, indexes, replaced_paths)
+    else:
+        merged = list(existing.image_paths)
+        width = max([len(merged) - 1, image_count - 1, *produced]) + 1
+        merged.extend([""] * (width - len(merged)))
+        for idx, path in zip(produced, replaced_paths):
+            merged[idx] = path
+        if image_result.get("await_anchor") and shots > 1:
+            for idx in produced:
+                if idx % shots == 0:
+                    for shot in range(1, shots):
+                        slot = (idx // shots) * shots + shot
+                        if slot < len(merged):
+                            merged[slot] = ""
+        local_image_paths = [path for path in merged if path]
 
     db_reject_approval(OUTBOX_DB_PATH, existing.approval_id, note=note or "图片驳回，已重新生成")
 
@@ -388,6 +541,7 @@ def _regenerate_image_review_approval(existing, note: str, image_indexes: List[i
         "reject_note": note,
         "replaced_indexes": indexes,
         "image_attempts": _merge_attempt_groups(extra.get("image_attempts") or [], image_result.get("attempts") or []),
+        "phase": "await_anchor" if image_result.get("await_anchor") else extra.get("phase") or "review_set",
     }
     new_approval = db_create_approval(
         OUTBOX_DB_PATH,
@@ -437,11 +591,13 @@ async def confirm_delivery_approval(
             return JSONResponse(content={"approval": existing.to_dict(), "message": "already_confirmed"})
 
         note = payload.note if payload else ""
+        scene_index = payload.scene_index if payload else None
         if _is_image_review_approval(existing):
             updated, commit_result = await asyncio.to_thread(
                 _confirm_image_review_approval,
                 existing,
                 note,
+                scene_index,
             )
             return JSONResponse(content={
                 "approval": updated.to_dict(),
@@ -542,63 +698,145 @@ def _get_feishu_reader():
     return fetch_all_source_rows, download_attachment, update_source_row_status
 
 
-@app.post("/batch-generate-v2")
-async def batch_generate_v2():
-    """
-    使用 LangGraph 批量子图处理飞书需求表。
-    每行都是一个 checkpoint，支持中断恢复。
-    """
-    batch_id = str(uuid4())[:8]
-    try:
-        run_batch_generate, _ = _get_batch_graph()
-        default_contacts = parse_target_contacts(DEFAULT_TARGET_CONTACTS)
+_batch_jobs_lock = threading.Lock()
+_batch_jobs: Dict[str, Dict[str, Any]] = {}
+_ACTIVE_BATCH_PATH = os.path.join(BASE_DIR, "data", "active_batch.json")
 
-        logger.info("[batch-v2-%s] 启动批量生成", batch_id)
-        result = await asyncio.to_thread(
-            run_batch_generate,
+
+def _read_active_batch() -> Optional[Dict[str, Any]]:
+    try:
+        with open(_ACTIVE_BATCH_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) and data.get("batch_id") else None
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_active_batch(batch_id: str, status: str) -> None:
+    os.makedirs(os.path.dirname(_ACTIVE_BATCH_PATH), exist_ok=True)
+    with open(_ACTIVE_BATCH_PATH, "w", encoding="utf-8") as handle:
+        json.dump({"batch_id": batch_id, "status": status}, handle, ensure_ascii=False)
+
+
+def _running_batch_id() -> Optional[str]:
+    with _batch_jobs_lock:
+        for batch_id, job in _batch_jobs.items():
+            if job.get("status") == "running":
+                return batch_id
+    return None
+
+
+def _batch_status_payload(batch_id: str) -> Optional[Dict[str, Any]]:
+    with _batch_jobs_lock:
+        job = dict(_batch_jobs.get(batch_id) or {})
+    active = _read_active_batch()
+    known = bool(job) or (active and active.get("batch_id") == batch_id)
+    _, get_batch_state_fn = _get_batch_graph()
+    try:
+        state = get_batch_state_fn(batch_id) or {}
+    except Exception as exc:
+        logger.warning("读取批次进度失败: %s", exc)
+        state = {}
+    if not known and not state:
+        return None
+
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    status = job.get("status")
+    if not status:
+        if active and active.get("batch_id") == batch_id and active.get("status") == "running":
+            status = "error"
+            job["error"] = "服务已重启，这次生成中断了"
+        elif state.get("final_message") or state.get("error_message"):
+            status = "error" if state.get("error_message") else "done"
+        else:
+            status = "running"
+    source_rows = result.get("source_rows") or state.get("source_rows") or []
+    row_results = result.get("row_results") or state.get("row_results") or []
+    return {
+        "batch_id": batch_id,
+        "status": status,
+        "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+        "message": result.get("final_message") or state.get("final_message") or "",
+        "total": len(source_rows),
+        "success_count": result.get("success_count", state.get("success_count", 0)) or 0,
+        "error_count": result.get("error_count", state.get("error_count", 0)) or 0,
+        "results": row_results,
+        "error": result.get("error_message") or state.get("error_message") or job.get("error"),
+    }
+
+
+def _run_batch_job(batch_id: str, default_contacts: List[str]) -> None:
+    run_batch_generate, _ = _get_batch_graph()
+    try:
+        result = run_batch_generate(
             batch_id=batch_id,
             default_contacts=default_contacts,
             require_confirmation=REQUIRE_DELIVERY_CONFIRMATION,
         )
-
-        return JSONResponse(content={
-            "batch_id": batch_id,
-            "message": result.get("final_message", "完成"),
-            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
-            "total": len(result.get("source_rows", [])),
-            "success_count": result.get("success_count", 0),
-            "error_count": result.get("error_count", 0),
-            "results": result.get("row_results", []),
-            "error": result.get("error_message"),
-        })
-    except Exception as e:
+        status = "error" if result.get("error_message") else "done"
+        with _batch_jobs_lock:
+            _batch_jobs[batch_id] = {"status": status, "result": result}
+        _write_active_batch(batch_id, status)
+    except Exception as exc:
         logger.exception("[batch-v2-%s] 批量生成异常", batch_id)
-        return JSONResponse(
-            content={"batch_id": batch_id, "error": str(e)},
-            status_code=500,
-        )
+        with _batch_jobs_lock:
+            _batch_jobs[batch_id] = {"status": "error", "error": str(exc)}
+        _write_active_batch(batch_id, "error")
+
+
+@app.post("/batch-generate-v2")
+async def batch_generate_v2():
+    """启动批量生成后立即返回批次号。页面刷新后用这个号把进度接回来。"""
+    existing = _running_batch_id()
+    if existing:
+        return JSONResponse(content={
+            "batch_id": existing,
+            "status": "running",
+            "already_running": True,
+            "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+        })
+
+    batch_id = str(uuid4())[:8]
+    default_contacts = parse_target_contacts(DEFAULT_TARGET_CONTACTS)
+    with _batch_jobs_lock:
+        _batch_jobs[batch_id] = {"status": "running"}
+    _write_active_batch(batch_id, "running")
+    logger.info("[batch-v2-%s] 启动批量生成", batch_id)
+    threading.Thread(
+        target=_run_batch_job,
+        args=(batch_id, default_contacts),
+        name=f"batch-{batch_id}",
+        daemon=True,
+    ).start()
+    return JSONResponse(content={
+        "batch_id": batch_id,
+        "status": "running",
+        "require_confirmation": REQUIRE_DELIVERY_CONFIRMATION,
+    })
+
+
+@app.get("/batch-generate-v2/current")
+async def batch_generate_v2_current():
+    """返回当前服务进程里最近一次批量任务，供页面刷新后接上。"""
+    active = _read_active_batch()
+    if not active:
+        return JSONResponse(content={"batch_id": None, "status": "idle"})
+    payload = _batch_status_payload(active["batch_id"])
+    if payload is None:
+        return JSONResponse(content={"batch_id": None, "status": "idle"})
+    return JSONResponse(content=payload)
 
 
 @app.get("/batch-generate-v2/status")
 async def batch_generate_v2_status(batch_id: str = Query(default="")):
-    """查询 LangGraph 批量子图的执行状态。"""
+    """查询批量任务进度。生成过程中也可以读到已经完成的行。"""
     if not batch_id:
         return JSONResponse(content={"error": "batch_id required"}, status_code=400)
     try:
-        _, get_batch_state_fn = _get_batch_graph()
-        state = get_batch_state_fn(batch_id)
-        if state is None:
+        payload = _batch_status_payload(batch_id)
+        if payload is None:
             return JSONResponse(content={"error": "batch_id not found"}, status_code=404)
-        return JSONResponse(content={
-            "batch_id": batch_id,
-            "current_index": state.get("current_index", 0),
-            "total": len(state.get("source_rows", [])),
-            "success_count": state.get("success_count", 0),
-            "error_count": state.get("error_count", 0),
-            "final_message": state.get("final_message"),
-            "error": state.get("error_message"),
-            "results": state.get("row_results", []),
-        })
+        return JSONResponse(content=payload)
     except Exception as e:
         logger.exception("查询 batch-v2 状态失败")
         return JSONResponse(content={"error": str(e)}, status_code=500)

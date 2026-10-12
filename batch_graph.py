@@ -137,6 +137,11 @@ def batch_failure_reason(result: Dict[str, Any] | None, *, image_count: int, def
     urls = image_result.get("image_urls") or []
     if image_count > 0 and not urls:
         return image_result.get("message") or "配图未生成"
+    if image_count > 0 and image_result.get("await_anchor") and not deferred:
+        return image_result.get("message") or "第 1 张未通过，未生成同组图片"
+    expected = int(image_result.get("expected_count") or image_count or 0)
+    if expected > image_count and not deferred and len(urls) < expected and not image_result.get("committed_to_feishu"):
+        return image_result.get("message") or "同组图片没有齐"
     if image_count > 0 and not deferred and not image_result.get("committed_to_feishu"):
         return image_result.get("message") or "配图未写入飞书结果表"
     return None
@@ -210,14 +215,17 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
             if require_confirmation:
                 decision = decide_delivery(
                     image_result,
-                    requested_count=row.image_count,
+                    requested_count=int(image_result.get("expected_count") or row.image_count),
                     require_confirmation=True,
                 )
                 if decision == "auto_accept":
                     commit_result = commit_images_to_feishu(
                         row.product_title,
                         product_image_path or image_bytes,
-                        image_result.get("image_urls") or [],
+                        image_result.get("local_image_paths") or image_result.get("image_urls") or [],
+                        review_text=result.get("reviews_formatted") or "",
+                        attempts=image_attempts,
+                        shots_per_scene=int(image_result.get("shots_per_scene") or 1),
                     )
                     if commit_result.get("status") != "success":
                         raise RuntimeError(commit_result.get("message") or "自动收下后写入飞书失败")
@@ -255,7 +263,10 @@ def process_row_node(state: BatchState) -> Dict[str, Any]:
                         "product_image_path": product_image_path,
                         "outfit_image_paths": outfit_image_paths,
                         "review_count": row.review_count,
-                        "image_count": row.image_count,
+                        "image_count": int(image_result.get("expected_count") or row.image_count),
+                        "scene_count": int(image_result.get("scene_count") or row.image_count),
+                        "shots_per_scene": int(image_result.get("shots_per_scene") or 1),
+                        "phase": "await_anchor" if image_result.get("await_anchor") else "review_set",
                         "image_reference_mode": result.get("image_result", {}).get("reference_mode"),
                         "image_reference_fields": result.get("image_result", {}).get("reference_fields", []),
                         "image_attempts": image_attempts,

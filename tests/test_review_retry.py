@@ -53,6 +53,7 @@ def _run(reviews, urls, **kwargs):
             image_bytes=b"\x89PNGproduct",
             product_name="白色斜肩连衣裙",
             scene_count=kwargs.pop("scene_count", 1),
+            shots_per_scene=kwargs.pop("shots_per_scene", 1),
             commit_to_feishu=False,
             **kwargs,
         )
@@ -174,6 +175,40 @@ def test_batch_row_auto_accepts_when_every_image_passes():
     assert row_result["image_attempts"] == image_result["attempts"]
     assert commit.call_count == 1
     assert approval.call_count == 0
+
+
+def test_failed_anchor_does_not_start_the_rest_of_the_scene():
+    result, _ = _run(
+        [FLOOR_REVIEW, FLOOR_REVIEW],
+        ["http://img/1", "http://img/2"],
+        shots_per_scene=3,
+    )
+    assert result["await_anchor"] is True
+    assert result["expected_count"] == 3
+    assert len(result["attempts"]) == 1
+    assert result["attempts"][0]["shot_index"] == 0
+    assert decide_delivery(result, requested_count=1, require_confirmation=False) == "fail"
+    assert decide_delivery(result, requested_count=1, require_confirmation=True) == "human_review"
+
+
+def test_passed_anchor_is_the_reference_for_later_shots():
+    with patch.object(
+        image_generator,
+        "generate_lifestyle_image_with_references",
+        return_value=("http://img/follow", "image"),
+    ) as ref:
+        result, (_, _, gen_mock, _, review_mock) = _run(
+            [PASS_REVIEW, PASS_REVIEW, PASS_REVIEW],
+            ["http://img/1"],
+            shots_per_scene=3,
+        )
+    assert gen_mock.call_count == 1
+    assert ref.call_count == 2
+    prompts = [group["attempts"][group["chosen"]]["prompt"] for group in result["attempts"][1:]]
+    assert all("保持图2" in prompt for prompt in prompts)
+    assert [group["shot_index"] for group in result["attempts"]] == [0, 1, 2]
+    assert result["await_anchor"] is False
+    assert review_mock.call_count == 3
 
 
 def test_prompt_diff_marks_insert_and_delete():

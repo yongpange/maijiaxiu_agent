@@ -247,10 +247,13 @@ def decide_delivery(
     """auto_accept：张数齐且每张最终都通过评审；human_review：其余情况且开了人工确认。"""
     result = image_result or {}
     urls = list(result.get("image_urls") or [])
-    if requested_count > 0 and not urls:
+    expected = int(result.get("expected_count") or requested_count or 0)
+    if result.get("await_anchor"):
+        return "human_review" if require_confirmation else "fail"
+    if expected > 0 and not urls:
         return "fail"
     groups = list(result.get("attempts") or [])
-    complete = requested_count <= 0 or len(urls) >= requested_count
+    complete = expected <= 0 or len(urls) >= expected
     all_passed = bool(groups) and len(groups) == len(urls) and all(
         _chosen_passed(group) for group in groups
     )

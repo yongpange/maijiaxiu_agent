@@ -27,6 +27,7 @@ from buyer_show_prompt import (
     build_borrow_pose_prompt,
     build_product_only_prompt,
     build_reference_scene_prompt,
+    build_same_scene_prompt,
     build_scene_messages,
     contains_banned_scene_word,
     garment_from_title,
@@ -48,6 +49,11 @@ logger = logging.getLogger("image-generator")
 
 PORTRAIT_SIZE = "1728x2304"
 SQUARE_SIZE = "2K"
+SHOTS_PER_SCENE = 3
+SAME_SCENE_VARIATIONS = (
+    "换一个机位，拍全身，人站着，手机拿在身前",
+    "换一个机位，人对着镜子或玻璃，仍是刚才那个地方",
+)
 
 
 # ========== 2. 调用 doubao 图生图 ==========
@@ -237,18 +243,51 @@ def write_to_feishu_table(product_name: str, product_image_token: str | None,
         return False
 
 
+def _chosen_image_source(group: dict) -> str:
+    attempts = group.get("attempts") or []
+    chosen = group.get("chosen")
+    if isinstance(chosen, int) and 0 <= chosen < len(attempts):
+        return attempts[chosen].get("image_path") or attempts[chosen].get("image_url") or ""
+    return ""
+
+
+def group_images_by_scene(sources: list, attempts: list | None, shots_per_scene: int) -> list[list]:
+    """一个场景一组。有场景标记时按场景分，否则每 shots_per_scene 张切一组。"""
+    if attempts:
+        buckets: dict[int, list] = {}
+        for group in attempts:
+            scene = group.get("scene_index")
+            if not isinstance(scene, int):
+                continue
+            source = _chosen_image_source(group)
+            if not source:
+                continue
+            buckets.setdefault(scene, []).append(source)
+        if buckets:
+            return [buckets[key] for key in sorted(buckets)]
+    size = shots_per_scene if shots_per_scene > 1 else 0
+    if size <= 1:
+        return [list(sources)] if sources else []
+    return [list(sources[i:i + size]) for i in range(0, len(sources), size) if sources[i:i + size]]
+
+
 def commit_images_to_feishu(
     product_name: str,
     product_image_source,
     generated_image_sources: list,
     review_text: str = "",
+    attempts: list | None = None,
+    shots_per_scene: int = SHOTS_PER_SCENE,
 ) -> dict:
-    """审核通过后，把商品图和候选买家秀图写回飞书结果表。"""
+    """一个场景写飞书一行：这一行只有该场景的图，并带上对应的一条评价。"""
+    from utils import split_review_blocks
+
     result = {
         "status": "error",
         "message": "",
         "product_image_token": None,
         "ai_image_tokens": [],
+        "row_count": 0,
     }
 
     try:
@@ -263,27 +302,51 @@ def commit_images_to_feishu(
         result["message"] = "❌ 商品图上传飞书失败"
         return result
 
-    ai_image_tokens = []
-    for idx, image_source in enumerate(generated_image_sources, start=1):
-        token = upload_image_to_feishu(image_source, feishu_token, f"lifestyle_{idx}.png")
-        if token:
-            ai_image_tokens.append(token)
-
-    if not ai_image_tokens:
-        result["message"] = "❌ 候选买家秀图上传飞书失败"
+    scene_groups = group_images_by_scene(generated_image_sources, attempts, shots_per_scene)
+    reviews = split_review_blocks(review_text)
+    row_count = max(len(scene_groups), len(reviews))
+    if row_count == 0:
+        result["message"] = "❌ 没有可写入飞书的图片或评价"
         return result
 
-    success = write_to_feishu_table(
-        product_name, product_image_token, ai_image_tokens, feishu_token, review_text=review_text,
-    )
+    written = 0
+    ai_image_tokens: list[str] = []
+    for row_index in range(row_count):
+        sources = scene_groups[row_index] if row_index < len(scene_groups) else []
+        review = reviews[row_index] if row_index < len(reviews) else ""
+        row_tokens = []
+        for image_index, image_source in enumerate(sources, start=1):
+            token = upload_image_to_feishu(
+                image_source,
+                feishu_token,
+                f"scene{row_index + 1}_{image_index}.png",
+            )
+            if token:
+                row_tokens.append(token)
+                ai_image_tokens.append(token)
+        if sources and not row_tokens:
+            result["message"] = f"❌ 场景 {row_index + 1} 的图片上传飞书失败"
+            return result
+        success = write_to_feishu_table(
+            product_name,
+            product_image_token,
+            row_tokens,
+            feishu_token,
+            review_text=review,
+        )
+        if not success:
+            result["status"] = "partial"
+            result["message"] = f"⚠️ 场景 {row_index + 1} 写入飞书表格失败"
+            result["ai_image_tokens"] = ai_image_tokens
+            result["row_count"] = written
+            return result
+        written += 1
+
     result["product_image_token"] = product_image_token
     result["ai_image_tokens"] = ai_image_tokens
-    if success:
-        result["status"] = "success"
-        result["message"] = f"🎉 审核通过，已写入 {len(ai_image_tokens)} 张买家秀图到飞书"
-    else:
-        result["status"] = "partial"
-        result["message"] = "⚠️ 图片已上传，但写入飞书表格失败"
+    result["row_count"] = written
+    result["status"] = "success"
+    result["message"] = f"🎉 审核通过，已按场景写入 {written} 行，共 {len(ai_image_tokens)} 张买家秀图"
     return result
 
 
@@ -540,6 +603,149 @@ def _generate_one(
     )
 
 
+def _chosen_attempt(group: dict) -> dict | None:
+    attempts = group.get("attempts") or []
+    chosen = group.get("chosen")
+    if not isinstance(chosen, int) or chosen < 0 or chosen >= len(attempts):
+        return None
+    return attempts[chosen]
+
+
+def _anchor_ready(group: dict) -> bool:
+    chosen = _chosen_attempt(group)
+    if not chosen or not os.path.isfile(chosen.get("image_path") or ""):
+        return False
+    review = ImageReview.from_dict(chosen.get("review"))
+    return bool(review.passed and not review.skipped)
+
+
+def _read_local_bytes(path: str) -> bytes | None:
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
+def _keep_group(result: dict, generated_urls: list[str], group: dict) -> None:
+    chosen = _chosen_attempt(group)
+    if not chosen:
+        return
+    generated_urls.append(chosen.get("image_url") or "")
+    result["attempts"].append(group)
+    result["prompts"].append(chosen.get("prompt") or "")
+    result["local_image_paths"].append(chosen.get("image_path") or "")
+    if chosen.get("reference_field"):
+        result["reference_fields"].append(chosen["reference_field"])
+
+
+def _generate_scene_sets(
+    result: dict,
+    generated_urls: list[str],
+    *,
+    indexes: list[int],
+    full_run: bool,
+    scene_count: int,
+    shots_per_scene: int,
+    image_bytes: bytes,
+    product_image_base64: str,
+    garment: dict,
+    memory,
+    rng: random.Random,
+    reject_note: str,
+    prior_attempts: list,
+) -> None:
+    """每个场景先出第 1 张。通过后才用它的本地图生成同组其余张。"""
+    index_set = None if full_run else set(indexes)
+    one_line = garment.get("one_line") or "服装"
+    for scene_i in range(scene_count):
+        base = scene_i * shots_per_scene
+        wanted = [
+            shot for shot in range(shots_per_scene)
+            if index_set is None or (base + shot) in index_set
+        ]
+        if not wanted:
+            continue
+        sentence = ""
+        anchor_bytes = None
+        if 0 in wanted:
+            slot = sample_slot(garment, memory, rng)
+            prior = prior_attempts[base] if base < len(prior_attempts) else None
+            if prior and prior.get("scene_sentence"):
+                sentence = prior["scene_sentence"]
+            else:
+                try:
+                    sentence = write_scene_sentence(
+                        garment, slot, reject_note=reject_note, rng=rng,
+                    )
+                except Exception as exc:
+                    logger.info("场景 %d 的场景句失败: %s", scene_i + 1, exc)
+                    continue
+            prompt = "" if prior and prior.get("prompt") else build_product_only_prompt(sentence, one_line)
+            group = _tag_group(
+                _generate_with_review(
+                    index=base,
+                    first_prompt=prompt,
+                    image_bytes=image_bytes,
+                    mode="product_only",
+                    product_image_base64=product_image_base64,
+                    outfit_bytes=None,
+                    prior_attempt=prior if prior and prior.get("prompt") else None,
+                    note=reject_note,
+                ),
+                scene_index=scene_i,
+                shot_index=0,
+                scene_sentence=sentence,
+            )
+            if group["chosen"] < 0:
+                logger.info("场景 %d 的第 1 张生成失败", scene_i + 1)
+                continue
+            _keep_group(result, generated_urls, group)
+            if not _anchor_ready(group):
+                result["await_anchor"] = True
+                continue
+            anchor_bytes = _read_local_bytes(_chosen_attempt(group).get("image_path") or "")
+        else:
+            prior_anchor = prior_attempts[base] if base < len(prior_attempts) else None
+            sentence = (prior_anchor or {}).get("scene_sentence") or ""
+            anchor_bytes = _read_local_bytes((prior_anchor or {}).get("image_path") or "")
+            if not anchor_bytes:
+                logger.info("场景 %d 没有可参考的第 1 张", scene_i + 1)
+                continue
+        for shot in wanted:
+            if shot == 0:
+                continue
+            variation = SAME_SCENE_VARIATIONS[min(shot - 1, len(SAME_SCENE_VARIATIONS) - 1)]
+            slot_index = base + shot
+            prior = prior_attempts[slot_index] if slot_index < len(prior_attempts) else None
+            prompt = "" if prior and prior.get("prompt") else build_same_scene_prompt(sentence, one_line, variation)
+            group = _tag_group(
+                _generate_with_review(
+                    index=slot_index,
+                    first_prompt=prompt,
+                    image_bytes=image_bytes,
+                    mode="follow_anchor",
+                    product_image_base64=product_image_base64,
+                    outfit_bytes=anchor_bytes,
+                    prior_attempt=prior if prior and prior.get("prompt") else None,
+                    note=reject_note,
+                ),
+                scene_index=scene_i,
+                shot_index=shot,
+                scene_sentence=sentence,
+            )
+            if group["chosen"] < 0:
+                logger.info("场景 %d 的第 %d 张生成失败", scene_i + 1, shot + 1)
+                continue
+            _keep_group(result, generated_urls, group)
+
+
+def _tag_group(group: dict, *, scene_index: int, shot_index: int, scene_sentence: str) -> dict:
+    group["scene_index"] = scene_index
+    group["shot_index"] = shot_index
+    group["scene_sentence"] = scene_sentence
+    return group
+
+
 def run_image_generation(
     image_bytes: bytes,
     product_name: str,
@@ -550,18 +756,19 @@ def run_image_generation(
     only_indexes: list[int] | None = None,
     review_text: str = "",
     prior_attempts: list[dict] | None = None,
+    shots_per_scene: int = SHOTS_PER_SCENE,
 ) -> dict:
     """
-    按晒图数量逐张生成。
+    飞书「晒图数量」是场景数。
 
-    有穿搭参考图且张数不超过参考图时，沿用参考图的场景，不另写场景句。
-    张数更多时，多出来的只借姿势并新写场景。
-    没有参考图时，每张单独抽槽位、单独写场景句。
-    视觉模型自由指出问题。不通过时保留原提示词，只在末尾追加约束，再生成一次。
-    prior_attempts 按图片序号存放上一轮采用的尝试。人工重做时不重写场景。
+    没有穿搭参考图时，每个场景固定多张：第 1 张通过后，用它的本地文件当参考，
+    再生成同一个人、同一个地方的另外几张。第 1 张没通过就先停住。
+    有穿搭参考图时仍按张换衣，不套这组规则。
     """
     outfit_image_bytes_list = outfit_image_bytes_list or []
     prior_attempts = prior_attempts or []
+    grouped = not outfit_image_bytes_list and shots_per_scene > 1
+    slot_count = scene_count * shots_per_scene if grouped else scene_count
     result = {
         "status": "error",
         "message": "",
@@ -574,22 +781,26 @@ def run_image_generation(
         "reference_fields": [],
         "committed_to_feishu": False,
         "image_indexes": [],
+        "expected_count": slot_count,
+        "shots_per_scene": shots_per_scene if grouped else 1,
+        "scene_count": scene_count if grouped else 0,
+        "await_anchor": False,
     }
 
     if only_indexes is None:
-        indexes = list(range(scene_count))
+        indexes = list(range(slot_count))
     else:
         indexes = []
         for raw in only_indexes:
             idx = int(raw)
-            if idx < 0 or idx >= scene_count:
+            if idx < 0 or idx >= slot_count:
                 raise ValueError(f"图片序号超出范围: {idx}")
             if idx not in indexes:
                 indexes.append(idx)
         if not indexes:
             result["message"] = "没有要重做的图片"
             return result
-    result["image_indexes"] = indexes
+    result["image_indexes"] = []
 
     garment = extract_garment_facts(image_bytes, product_name)
     product_image_base64 = _image_bytes_to_data_uri(image_bytes)
@@ -597,7 +808,7 @@ def run_image_generation(
     rng = random.Random()
     generated_urls: list[str] = []
 
-    for index in indexes:
+    for index in ([] if grouped else indexes):
         if outfit_image_bytes_list and index < len(outfit_image_bytes_list):
             mode = "use_ref_scene"
             outfit_bytes = outfit_image_bytes_list[index]
@@ -641,16 +852,30 @@ def run_image_generation(
         if group["chosen"] < 0:
             logger.info("第 %d 张生成失败，跳过", index + 1)
             continue
-        chosen = group["attempts"][group["chosen"]]
-        generated_urls.append(chosen["image_url"])
-        result["attempts"].append(group)
-        result["prompts"].append(chosen["prompt"])
-        result["local_image_paths"].append(chosen.get("image_path") or "")
-        if chosen.get("reference_field"):
-            result["reference_fields"].append(chosen["reference_field"])
+        _keep_group(result, generated_urls, group)
+
+    if grouped:
+        _generate_scene_sets(
+            result,
+            generated_urls,
+            indexes=indexes,
+            full_run=only_indexes is None,
+            scene_count=scene_count,
+            shots_per_scene=shots_per_scene,
+            image_bytes=image_bytes,
+            product_image_base64=product_image_base64,
+            garment=garment,
+            memory=memory,
+            rng=rng,
+            reject_note=reject_note,
+            prior_attempts=prior_attempts,
+        )
 
     result["image_urls"] = generated_urls
-    short = len(generated_urls) < len(indexes)
+    result["image_indexes"] = [group.get("index") for group in result["attempts"]]
+    short = len(generated_urls) < (slot_count if only_indexes is None else len(indexes))
+    if result.get("await_anchor"):
+        result["message"] = "第 1 张未通过评审，同组其余图片先不生成"
 
     if not generated_urls:
         result["message"] = "❌ 所有场景图生成均失败，请检查 DOUBAO_API_KEY 是否正确"
@@ -658,15 +883,27 @@ def run_image_generation(
 
     if not commit_to_feishu:
         result["status"] = "partial" if short else "success"
-        result["message"] = (
-            f"生成了 {len(generated_urls)}/{len(indexes)} 张，缺的张留给人工"
-            if short
-            else f"✅ 成功生成 {len(generated_urls)} 张待审核买家秀图，尚未写入飞书"
-        )
+        if not result.get("message"):
+            result["message"] = (
+                f"生成了 {len(generated_urls)}/{slot_count} 张，缺的张留给人工"
+                if short
+                else f"✅ 成功生成 {len(generated_urls)} 张待审核买家秀图，尚未写入飞书"
+            )
+        return result
+
+    if short or result.get("await_anchor"):
+        result["status"] = "partial"
+        if not result.get("message"):
+            result["message"] = f"生成了 {len(generated_urls)}/{slot_count} 张，缺的张留给人工"
         return result
 
     commit_result = commit_images_to_feishu(
-        product_name, image_bytes, generated_urls, review_text=review_text,
+        product_name,
+        image_bytes,
+        result.get("local_image_paths") or generated_urls,
+        review_text=review_text,
+        attempts=result.get("attempts") or [],
+        shots_per_scene=int(result.get("shots_per_scene") or 1),
     )
 
     if commit_result.get("status") == "success":
